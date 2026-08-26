@@ -117,10 +117,14 @@ async def enqueue_video(message: dict, media: dict):
     batch.task = asyncio.create_task(collect_later(user_id, chat_id))
 
 
-def extract_thumbnail(source: Path, destination: Path) -> bool:
+def extract_thumbnail(source: Path, destination: Path, kind: str) -> bool:
     destination.parent.mkdir(parents=True, exist_ok=True)
+    command = ["ffmpeg", "-y"]
+    if kind == "video":
+        command.extend(["-ss", "00:00:01"])
+    command.extend(["-i", str(source), "-frames:v", "1", "-vf", "scale='min(640,iw)':-2", str(destination)])
     result = subprocess.run(
-        ["ffmpeg", "-y", "-ss", "00:00:01", "-i", str(source), "-frames:v", "1", "-vf", "scale='min(640,iw)':-2", str(destination)],
+        command,
         capture_output=True,
         text=True,
     )
@@ -155,7 +159,7 @@ async def process_series(chat_id: int, title: str, files: list[dict]):
             except OSError:
                 shutil.copy2(source, renamed)
             thumb = DATA_DIR / "thumbnails" / f"series-{series_id}-{position}.jpg"
-            extract_thumbnail(renamed, thumb)
+            extract_thumbnail(renamed, thumb, item["kind"])
             # local Bot API가 같은 볼륨을 읽어 파일명 그대로 Telegram에 올립니다.
             sent = await tg.send_document(chat_id, renamed, stored_name)
             attachment = sent.get("document") or sent.get("video")
