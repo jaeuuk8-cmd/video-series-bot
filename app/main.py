@@ -54,6 +54,20 @@ class Telegram:
     async def send_text(self, chat_id: int, text: str, **extra):
         return await self.call("sendMessage", chat_id=chat_id, text=text, **extra)
 
+    async def send_document(self, chat_id: int, path: Path, caption: str):
+        """Upload the renamed file directly instead of relying on a shared path."""
+        with path.open("rb") as document:
+            response = await self.client.post(
+                f"{BOT_API_URL}/bot{BOT_TOKEN}/sendDocument",
+                data={"chat_id": str(chat_id), "caption": caption},
+                files={"document": (path.name, document, "application/octet-stream")},
+            )
+        response.raise_for_status()
+        body = response.json()
+        if not body.get("ok"):
+            raise RuntimeError(body.get("description", "Telegram API error"))
+        return body["result"]
+
 
 tg = Telegram()
 
@@ -131,7 +145,7 @@ async def process_series(chat_id: int, title: str, files: list[dict]):
             thumb = DATA_DIR / "thumbnails" / f"series-{series_id}-{position}.jpg"
             extract_thumbnail(renamed, thumb)
             # local Bot API가 같은 볼륨을 읽어 파일명 그대로 Telegram에 올립니다.
-            sent = await tg.call("sendDocument", chat_id=chat_id, document=f"file://{renamed}", caption=stored_name)
+            sent = await tg.send_document(chat_id, renamed, stored_name)
             document = sent["document"]
             db.add_video(series_id, position, stored_name, item["original_filename"], document["file_id"], str(thumb) if thumb.exists() else None)
             await tg.send_text(chat_id, f"{stored_name} 등록 완료 ({position}/{len(files)})")
