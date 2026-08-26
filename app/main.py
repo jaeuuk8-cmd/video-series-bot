@@ -36,7 +36,9 @@ class PendingBatch:
 
 pending: dict[int, PendingBatch] = defaultdict(PendingBatch)
 waiting_title: dict[int, list[dict]] = {}
-SUPPORTED_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+SUPPORTED_EXTENSIONS = VIDEO_EXTENSIONS | IMAGE_EXTENSIONS
 
 
 class Telegram:
@@ -78,14 +80,23 @@ def allowed(message: dict) -> bool:
 
 def media_from(message: dict) -> dict | None:
     # 파일(문서) 전송을 우선 권장하지만 동영상 메시지도 허용합니다.
+    if message.get("photo"):
+        photo = message["photo"][-1]
+        return {"file_id": photo["file_id"], "original_filename": "photo.jpg", "kind": "image"}
+
     media = message.get("document") or message.get("video")
     if not media:
         return None
     mime = media.get("mime_type", "")
     filename = media.get("file_name") or "video.mp4"
-    if not (mime.startswith("video/") or Path(filename).suffix.lower() in SUPPORTED_EXTENSIONS):
+    extension = Path(filename).suffix.lower()
+    if not (mime.startswith(("video/", "image/")) or extension in SUPPORTED_EXTENSIONS):
         return None
-    return {"file_id": media["file_id"], "original_filename": filename}
+    return {
+        "file_id": media["file_id"],
+        "original_filename": filename,
+        "kind": "image" if mime.startswith("image/") or extension in IMAGE_EXTENSIONS else "video",
+    }
 
 
 async def collect_later(user_id: int, chat_id: int):
@@ -116,10 +127,11 @@ def extract_thumbnail(source: Path, destination: Path) -> bool:
     return result.returncode == 0 and destination.exists()
 
 
-def sequential_filename(position: int, original_filename: str) -> str:
-    """Keep the real container extension; relabeling an AVI as MP4 is misleading."""
+def sequential_filename(position: int, original_filename: str, kind: str) -> str:
+    """Keep the real container extension; never relabel images or AVI files."""
     extension = Path(original_filename).suffix.lower()
-    return f"{position}{extension if extension in SUPPORTED_EXTENSIONS else '.mp4'}"
+    fallback = ".jpg" if kind == "image" else ".mp4"
+    return f"{position}{extension if extension in SUPPORTED_EXTENSIONS else fallback}"
 
 
 async def process_series(chat_id: int, title: str, files: list[dict]):
@@ -129,7 +141,7 @@ async def process_series(chat_id: int, title: str, files: list[dict]):
     await tg.send_text(chat_id, f"‘{title}’ 등록을 시작합니다. 대용량 파일은 시간이 걸릴 수 있습니다.")
     try:
         for position, item in enumerate(files, start=1):
-            stored_name = sequential_filename(position, item["original_filename"])
+            stored_name = sequential_filename(position, item["original_filename"], item["kind"])
             info = await tg.call("getFile", file_id=item["file_id"])
             # Local Bot API mode에서는 이 값이 컨테이너 공용 볼륨의 절대 경로입니다.
             source = Path(info["file_path"])
@@ -146,8 +158,12 @@ async def process_series(chat_id: int, title: str, files: list[dict]):
             extract_thumbnail(renamed, thumb)
             # local Bot API가 같은 볼륨을 읽어 파일명 그대로 Telegram에 올립니다.
             sent = await tg.send_document(chat_id, renamed, stored_name)
-            document = sent["document"]
-            db.add_video(series_id, position, stored_name, item["original_filename"], document["file_id"], str(thumb) if thumb.exists() else None)
+            attachment = sent.get("document") or sent.get("video")
+            if not attachment and sent.get("photo"):
+                attachment = sent["photo"][-1]
+            if not attachment:
+                raise RuntimeError("Telegram did not return the uploaded file information.")
+            db.add_video(series_id, position, stored_name, item["original_filename"], attachment["file_id"], str(thumb) if thumb.exists() else None)
             await tg.send_text(chat_id, f"{stored_name} 등록 완료 ({position}/{len(files)})")
     except Exception as exc:
         await tg.send_text(chat_id, f"등록 중 오류가 발생했습니다: {exc}")
