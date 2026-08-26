@@ -12,7 +12,7 @@ from pathlib import Path
 from urllib.parse import parse_qsl
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import Body, FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
 import uvicorn
 
@@ -266,6 +266,26 @@ async def videos(series_id: int, x_telegram_init_data: str | None = Header(defau
     return [{"id": row["id"], "filename": row["stored_filename"], "position": row["position"], "thumb": f"/api/thumb/{row['id']}" if row["thumbnail_path"] else None} for row in db.list_videos(series_id)]
 
 
+@app.patch("/api/series/{series_id}")
+async def rename_series(series_id: int, payload: dict = Body(...), x_telegram_init_data: str | None = Header(default=None)):
+    validate_init_data(x_telegram_init_data)
+    title = str(payload.get("title", "")).strip()
+    if not title:
+        raise HTTPException(400, "A series title is required.")
+    if not db.rename_series(series_id, title[:100]):
+        raise HTTPException(404, "Series not found.")
+    return {"ok": True}
+
+
+@app.delete("/api/series/{series_id}")
+async def delete_series(series_id: int, x_telegram_init_data: str | None = Header(default=None)):
+    validate_init_data(x_telegram_init_data)
+    paths = db.delete_series(series_id)
+    for value in paths:
+        Path(value).unlink(missing_ok=True)
+    return {"ok": True}
+
+
 @app.post("/api/video/{video_id}/send")
 async def send_video(video_id: int, x_telegram_init_data: str | None = Header(default=None)):
     validate_init_data(x_telegram_init_data)
@@ -288,6 +308,21 @@ async def thumbnail(video_id: int, x_telegram_init_data: str | None = Header(def
 HTML = """<!doctype html><html lang='ko'><meta name='viewport' content='width=device-width,initial-scale=1'>
 <script src='https://telegram.org/js/telegram-web-app.js'></script><style>body{font-family:system-ui;margin:16px;background:#f5f5f5;color:#111}.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}.card{background:#fff;border-radius:12px;overflow:hidden;padding:10px}.cover{width:100%;aspect-ratio:16/9;object-fit:cover;background:#ddd}button{border:0;background:none;padding:0;text-align:left;font:inherit;width:100%}.muted{color:#666;font-size:13px}</style>
 <h2 id='title'>내 시리즈</h2><div id='list' class='grid'></div><script>const init=Telegram.WebApp.initData, H={'X-Telegram-Init-Data':init}, list=document.querySelector('#list');Telegram.WebApp.ready();async function img(url){if(!url)return '';let r=await fetch(url,{headers:H}),b=await r.blob();return URL.createObjectURL(b)}async function load(){let rows=await (await fetch('/api/series',{headers:H})).json();list.innerHTML='';for(let x of rows){let u=await img(x.cover);let b=document.createElement('button');b.className='card';b.innerHTML=(u?`<img class='cover' src='${u}'>`:'<div class="cover"></div>')+`<b>${x.title}</b><div class='muted'>${x.count}편</div>`;b.onclick=()=>open(x);list.append(b)}}async function open(x){document.querySelector('#title').textContent=x.title;let rows=await (await fetch('/api/series/'+x.id,{headers:H})).json();list.innerHTML='';for(let v of rows){let u=await img(v.thumb);let b=document.createElement('button');b.className='card';b.innerHTML=(u?`<img class='cover' src='${u}'>`:'<div class="cover"></div>')+`<b>${v.filename}</b><div class='muted'>누르면 텔레그램으로 전송</div>`;b.onclick=async()=>{await fetch('/api/video/'+v.id+'/send',{method:'POST',headers:H});Telegram.WebApp.showAlert(v.filename+'을(를) 채팅으로 보냈습니다.')};list.append(b)}}load().catch(()=>list.textContent='텔레그램에서 이 화면을 다시 열어주세요.');</script></html>"""
+
+
+HTML = """<!doctype html><html lang='en'><meta name='viewport' content='width=device-width,initial-scale=1'>
+<script src='https://telegram.org/js/telegram-web-app.js'></script>
+<style>body{font-family:system-ui;margin:16px;background:#f5f5f5;color:#111}.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}.card{background:#fff;border-radius:12px;overflow:hidden;padding:10px}.cover{width:100%;aspect-ratio:16/9;object-fit:cover;background:#ddd}button{border:0;background:none;padding:0;text-align:left;font:inherit;width:100%}.muted{color:#666;font-size:13px}.controls{display:flex;gap:8px;margin:0 0 14px}.controls button{width:auto;background:#fff;border:1px solid #ddd;border-radius:8px;padding:8px 10px}.controls .danger{color:#b42318}</style>
+<h2 id='title'>My series</h2><div id='controls' class='controls'></div><div id='list' class='grid'></div>
+<script>
+const init=Telegram.WebApp.initData,H={'X-Telegram-Init-Data':init},title=document.querySelector('#title'),controls=document.querySelector('#controls'),list=document.querySelector('#list');Telegram.WebApp.ready();
+async function api(url,options={}){let r=await fetch(url,{...options,headers:{...H,...(options.headers||{})}});if(!r.ok)throw new Error(await r.text());return r.json()}
+async function img(url){if(!url)return '';let r=await fetch(url,{headers:H});if(!r.ok)return '';return URL.createObjectURL(await r.blob())}
+function card(name,cover,sub,onClick){let b=document.createElement('button');b.className='card';b.innerHTML=(cover?`<img class='cover' src='${cover}'>`:'<div class='cover'></div>')+`<b></b><div class='muted'></div>`;b.querySelector('b').textContent=name;b.querySelector('.muted').textContent=sub;b.onclick=onClick;return b}
+async function load(){title.textContent='My series';controls.innerHTML='';let rows=await api('/api/series');list.innerHTML='';for(let x of rows){list.append(card(x.title,await img(x.cover),x.count+' items',()=>open(x)))}}
+async function open(x){title.textContent=x.title;controls.innerHTML='';let back=document.createElement('button');back.textContent='Back';back.onclick=load;let rename=document.createElement('button');rename.textContent='Rename';rename.onclick=async()=>{let value=prompt('New series title',x.title);if(!value||!value.trim())return;await api('/api/series/'+x.id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:value.trim()})});await load()};let remove=document.createElement('button');remove.className='danger';remove.textContent='Delete';remove.onclick=async()=>{if(!confirm('Delete this series and its thumbnails?'))return;await api('/api/series/'+x.id,{method:'DELETE'});await load()};controls.append(back,rename,remove);let rows=await api('/api/series/'+x.id);list.innerHTML='';for(let v of rows){list.append(card(v.filename,await img(v.thumb),'Tap to send to Telegram',async()=>{await api('/api/video/'+v.id+'/send',{method:'POST'});Telegram.WebApp.showAlert(v.filename+' was sent to this chat.')}))}}
+load().catch(()=>list.textContent='Open this page from Telegram.');
+</script></html>"""
 
 
 @app.on_event("startup")
