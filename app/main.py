@@ -168,7 +168,8 @@ async def process_series(chat_id: int, title: str, files: list[dict]):
             if not attachment:
                 raise RuntimeError("Telegram did not return the uploaded file information.")
             db.add_video(series_id, position, stored_name, item["original_filename"], attachment["file_id"], str(thumb) if thumb.exists() else None)
-            await tg.send_text(chat_id, f"{stored_name} 등록 완료 ({position}/{len(files)})")
+            # Keep Telegram's reusable file ID, but do not leave renamed uploads in the chat.
+            await tg.call("deleteMessage", chat_id=chat_id, message_id=sent["message_id"])
     except Exception as exc:
         await tg.send_text(chat_id, f"등록 중 오류가 발생했습니다: {exc}")
     finally:
