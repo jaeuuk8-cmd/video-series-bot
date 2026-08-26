@@ -325,6 +325,26 @@ load().catch(()=>list.textContent='Open this page from Telegram.');
 </script></html>"""
 
 
+HTML = """<!doctype html><html lang='en'><meta name='viewport' content='width=device-width,initial-scale=1'>
+<script src='https://telegram.org/js/telegram-web-app.js'></script>
+<style>body{font-family:system-ui;margin:16px;background:#f5f5f5;color:#111}.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}.card{background:#fff;border:0;border-radius:12px;overflow:hidden;padding:10px;text-align:left;font:inherit}.cover{width:100%;aspect-ratio:16/9;object-fit:cover;background:#ddd}.muted{color:#666;font-size:13px}.controls{display:flex;gap:8px;margin:0 0 14px}.controls button{background:#fff;border:1px solid #ddd;border-radius:8px;padding:8px 10px}.controls .danger{color:#b42318}</style>
+<h2 id='title'>My series</h2><div id='controls' class='controls'></div><div id='list' class='grid'></div>
+<script>
+(function(){
+var title=document.getElementById('title'),controls=document.getElementById('controls'),list=document.getElementById('list');
+var webApp=window.Telegram&&window.Telegram.WebApp;
+if(!webApp){list.textContent='Open this page from Telegram.';return;}
+var headers={'X-Telegram-Init-Data':webApp.initData};webApp.ready();
+async function api(url,options){options=options||{};options.headers=Object.assign({},headers,options.headers||{});var response=await fetch(url,options);if(!response.ok)throw new Error(await response.text());return response.json();}
+async function imageUrl(url){if(!url)return '';var response=await fetch(url,{headers:headers});if(!response.ok)return '';return URL.createObjectURL(await response.blob());}
+function makeCard(name,cover,subtitle,handler){var card=document.createElement('button');card.className='card';if(cover){var image=document.createElement('img');image.className='cover';image.src=cover;card.appendChild(image);}else{var blank=document.createElement('div');blank.className='cover';card.appendChild(blank);}var nameEl=document.createElement('b');nameEl.textContent=name;card.appendChild(nameEl);var sub=document.createElement('div');sub.className='muted';sub.textContent=subtitle;card.appendChild(sub);card.onclick=handler;return card;}
+async function load(){title.textContent='My series';controls.innerHTML='';var rows=await api('/api/series');list.innerHTML='';for(var i=0;i<rows.length;i++){var series=rows[i];var cover=await imageUrl(series.cover);list.appendChild(makeCard(series.title,cover,series.count+' items',(function(value){return function(){openSeries(value);};})(series)));}}
+async function openSeries(series){title.textContent=series.title;controls.innerHTML='';var back=document.createElement('button');back.textContent='Back';back.onclick=load;var rename=document.createElement('button');rename.textContent='Rename';rename.onclick=async function(){var value=prompt('New series title',series.title);if(!value||!value.trim())return;await api('/api/series/'+series.id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:value.trim()})});await load();};var remove=document.createElement('button');remove.className='danger';remove.textContent='Delete';remove.onclick=async function(){if(!confirm('Delete this series and its thumbnails?'))return;await api('/api/series/'+series.id,{method:'DELETE'});await load();};controls.append(back,rename,remove);var rows=await api('/api/series/'+series.id);list.innerHTML='';for(var i=0;i<rows.length;i++){var video=rows[i];var thumb=await imageUrl(video.thumb);list.appendChild(makeCard(video.filename,thumb,'Tap to send to Telegram',(function(value){return async function(){await api('/api/video/'+value.id+'/send',{method:'POST'});webApp.showAlert(value.filename+' was sent to this chat.');};})(video)));}}
+load().catch(function(){list.textContent='Could not load the library. Open it again from Telegram.';});
+})();
+</script></html>"""
+
+
 @app.on_event("startup")
 async def start_polling():
     asyncio.create_task(polling())
