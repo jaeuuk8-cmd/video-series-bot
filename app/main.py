@@ -36,6 +36,9 @@ class PendingBatch:
 
 pending: dict[int, PendingBatch] = defaultdict(PendingBatch)
 waiting_title: dict[int, list[dict]] = {}
+# A target selected with /add (or the library's Add media button).  Only the
+# owner can use this bot, so one target per owner is sufficient.
+adding_to_series: dict[int, int] = {}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 SUPPORTED_EXTENSIONS = VIDEO_EXTENSIONS | IMAGE_EXTENSIONS
@@ -104,6 +107,10 @@ async def collect_later(user_id: int, chat_id: int):
     batch = pending.pop(user_id, None)
     if not batch or not batch.files:
         return
+    target_series_id = adding_to_series.pop(user_id, None)
+    if target_series_id is not None:
+        asyncio.create_task(append_to_series(chat_id, target_series_id, batch.files))
+        return
     waiting_title[user_id] = batch.files
     await tg.send_text(chat_id, f"영상 {len(batch.files)}개를 한 시리즈로 준비했습니다. 시리즈 제목을 보내주세요.\n/cancel 로 취소할 수 있습니다.")
 
@@ -138,13 +145,13 @@ def sequential_filename(position: int, original_filename: str, kind: str) -> str
     return f"{position}{extension if extension in SUPPORTED_EXTENSIONS else fallback}"
 
 
-async def process_series(chat_id: int, title: str, files: list[dict]):
-    series_id = db.create_series(title)
+async def store_files(chat_id: int, series_id: int, files: list[dict]) -> int:
+    """Store media in an existing series and return the number saved."""
     work_dir = DATA_DIR / "jobs" / f"series-{series_id}-{int(time.time())}"
     work_dir.mkdir(parents=True, exist_ok=True)
-    await tg.send_text(chat_id, f"‘{title}’ 등록을 시작합니다. 대용량 파일은 시간이 걸릴 수 있습니다.")
     try:
-        for position, item in enumerate(files, start=1):
+        first_position = db.next_position(series_id)
+        for position, item in enumerate(files, start=first_position):
             stored_name = sequential_filename(position, item["original_filename"], item["kind"])
             info = await tg.call("getFile", file_id=item["file_id"])
             # Local Bot API mode에서는 이 값이 컨테이너 공용 볼륨의 절대 경로입니다.
@@ -170,15 +177,37 @@ async def process_series(chat_id: int, title: str, files: list[dict]):
             db.add_video(series_id, position, stored_name, item["original_filename"], attachment["file_id"], str(thumb) if thumb.exists() else None)
             # Keep Telegram's reusable file ID, but do not leave renamed uploads in the chat.
             await tg.call("deleteMessage", chat_id=chat_id, message_id=sent["message_id"])
-    except Exception as exc:
-        await tg.send_text(chat_id, f"등록 중 오류가 발생했습니다: {exc}")
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
+    return len(files)
+
+
+async def process_series(chat_id: int, title: str, files: list[dict]):
+    series_id = db.create_series(title)
+    await tg.send_text(chat_id, f"‘{title}’ 등록을 시작합니다. 대용량 파일은 시간이 걸릴 수 있습니다.")
+    try:
+        await store_files(chat_id, series_id, files)
+    except Exception as exc:
+        await tg.send_text(chat_id, f"등록 중 오류가 발생했습니다: {exc}")
+        return
     await tg.send_text(
         chat_id,
         f"등록이 끝났습니다. /library 에서 시리즈 목록을 열 수 있습니다.\n"
         f"대표 썸네일 변경: /cover {series_id} 영상번호  (예: /cover {series_id} 3)",
     )
+
+
+async def append_to_series(chat_id: int, series_id: int, files: list[dict]):
+    if not db.series_exists(series_id):
+        await tg.send_text(chat_id, "추가할 시리즈를 찾지 못했습니다. /library에서 다시 선택하세요.")
+        return
+    await tg.send_text(chat_id, f"시리즈 #{series_id}에 {len(files)}개 파일을 추가합니다.")
+    try:
+        await store_files(chat_id, series_id, files)
+    except Exception as exc:
+        await tg.send_text(chat_id, f"추가 중 오류가 발생했습니다: {exc}")
+        return
+    await tg.send_text(chat_id, f"추가가 끝났습니다. /library에서 확인하세요.")
 
 
 def webapp_button():
@@ -196,6 +225,15 @@ async def handle_message(message: dict):
     if text == "/library":
         await tg.send_text(chat_id, "시리즈 목록입니다.", reply_markup=webapp_button())
         return
+    if text.startswith("/add"):
+        parts = text.split()
+        if len(parts) != 2 or not parts[1].isdigit() or not db.series_exists(int(parts[1])):
+            await tg.send_text(chat_id, "사용법: /add 시리즈번호\n예: /add 3")
+            return
+        adding_to_series[user_id] = int(parts[1])
+        waiting_title.pop(user_id, None)
+        await tg.send_text(chat_id, "추가할 영상 또는 사진을 연달아 보내세요. 5초간 새 파일이 없으면 자동으로 추가합니다. /cancel 로 취소할 수 있습니다.")
+        return
     if text.startswith("/cover"):
         parts = text.split()
         if len(parts) != 3 or not parts[1].isdigit() or not parts[2].isdigit():
@@ -209,6 +247,7 @@ async def handle_message(message: dict):
     if text == "/cancel":
         pending.pop(user_id, None)
         waiting_title.pop(user_id, None)
+        adding_to_series.pop(user_id, None)
         await tg.send_text(chat_id, "대기 중인 시리즈 등록을 취소했습니다.")
         return
     media = media_from(message)
@@ -286,6 +325,20 @@ async def delete_series(series_id: int, x_telegram_init_data: str | None = Heade
     return {"ok": True}
 
 
+@app.post("/api/series/{series_id}/add")
+async def select_series_for_append(series_id: int, x_telegram_init_data: str | None = Header(default=None)):
+    validate_init_data(x_telegram_init_data)
+    if not db.series_exists(series_id):
+        raise HTTPException(404, "Series not found.")
+    adding_to_series[OWNER_ID] = series_id
+    waiting_title.pop(OWNER_ID, None)
+    await tg.send_text(
+        OWNER_ID,
+        "추가할 영상 또는 사진을 연달아 보내세요. 5초간 새 파일이 없으면 선택한 시리즈에 자동 추가합니다. /cancel 로 취소할 수 있습니다.",
+    )
+    return {"ok": True}
+
+
 @app.post("/api/video/{video_id}/send")
 async def send_video(video_id: int, x_telegram_init_data: str | None = Header(default=None)):
     validate_init_data(x_telegram_init_data)
@@ -339,8 +392,9 @@ async function api(url,options){options=options||{};options.headers=Object.assig
 async function imageUrl(url){if(!url)return '';var response=await fetch(url,{headers:headers});if(!response.ok)return '';return URL.createObjectURL(await response.blob());}
 function makeCard(name,cover,subtitle,handler){var card=document.createElement('button');card.className='card';if(cover){var image=document.createElement('img');image.className='cover';image.src=cover;card.appendChild(image);}else{var blank=document.createElement('div');blank.className='cover';card.appendChild(blank);}var nameEl=document.createElement('b');nameEl.textContent=name;card.appendChild(nameEl);var sub=document.createElement('div');sub.className='muted';sub.textContent=subtitle;card.appendChild(sub);card.onclick=handler;return card;}
 async function load(){title.textContent='My series';controls.innerHTML='';var rows=await api('/api/series');list.innerHTML='';for(var i=0;i<rows.length;i++){var series=rows[i];var cover=await imageUrl(series.cover);list.appendChild(makeCard(series.title,cover,series.count+' items',(function(value){return function(){openSeries(value);};})(series)));}}
-async function openSeries(series){title.textContent=series.title;controls.innerHTML='';var back=document.createElement('button');back.textContent='Back';back.onclick=load;var rename=document.createElement('button');rename.textContent='Rename';rename.onclick=async function(){var value=prompt('New series title',series.title);if(!value||!value.trim())return;await api('/api/series/'+series.id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:value.trim()})});await load();};var remove=document.createElement('button');remove.className='danger';remove.textContent='Delete';remove.onclick=async function(){if(!confirm('Delete this series and its thumbnails?'))return;await api('/api/series/'+series.id,{method:'DELETE'});await load();};controls.append(back,rename,remove);var rows=await api('/api/series/'+series.id);list.innerHTML='';for(var i=0;i<rows.length;i++){var video=rows[i];var thumb=await imageUrl(video.thumb);list.appendChild(makeCard(video.filename,thumb,'Tap to send to Telegram',(function(value){return async function(){await api('/api/video/'+value.id+'/send',{method:'POST'});webApp.showAlert(value.filename+' was sent to this chat.');};})(video)));}}
-load().catch(function(){list.textContent='Could not load the library. Open it again from Telegram.';});
+function showError(error){webApp.showAlert('작업에 실패했습니다: '+String(error.message||error));}
+async function openSeries(series){title.textContent=series.title;controls.innerHTML='';var back=document.createElement('button');back.textContent='Back';back.onclick=load;var add=document.createElement('button');add.textContent='Add media';add.onclick=async function(){try{await api('/api/series/'+series.id+'/add',{method:'POST'});webApp.showAlert('이제 봇 채팅에서 영상 또는 사진을 보내세요. 5초 뒤 자동으로 추가됩니다.');}catch(error){showError(error);}};var rename=document.createElement('button');rename.textContent='Rename';rename.onclick=async function(){var value=prompt('New series title',series.title);if(!value||!value.trim())return;try{await api('/api/series/'+series.id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:value.trim()})});await load();}catch(error){showError(error);}};var remove=document.createElement('button');remove.className='danger';remove.textContent='Delete';remove.onclick=async function(){if(!confirm('Delete this series and its thumbnails?'))return;try{await api('/api/series/'+series.id,{method:'DELETE'});await load();}catch(error){showError(error);}};controls.append(back,add,rename,remove);var rows=await api('/api/series/'+series.id);list.innerHTML='';for(var i=0;i<rows.length;i++){var video=rows[i];var thumb=await imageUrl(video.thumb);list.appendChild(makeCard(video.filename,thumb,'Tap to send to Telegram',(function(value){return async function(){try{await api('/api/video/'+value.id+'/send',{method:'POST'});webApp.showAlert(value.filename+' was sent to this chat.');}catch(error){showError(error);}};})(video)));}}
+load().catch(function(error){list.textContent='라이브러리를 불러오지 못했습니다.';showError(error);});
 })();
 </script></html>"""
 
