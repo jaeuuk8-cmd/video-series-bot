@@ -67,27 +67,42 @@ class Database:
                 (series_id,),
             ).fetchall()
 
+    def series_exists(self, series_id: int) -> bool:
+        with self.connect() as conn:
+            return conn.execute("SELECT 1 FROM series WHERE id = ?", (series_id,)).fetchone() is not None
+
+    def next_position(self, series_id: int) -> int:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(position), 0) + 1 AS value FROM video WHERE series_id = ?", (series_id,)
+            ).fetchone()
+            return int(row["value"])
+
     def thumbnail_for_video(self, video_id: int):
         with self.connect() as conn:
             return conn.execute("SELECT thumbnail_path FROM video WHERE id = ?", (video_id,)).fetchone()
 
     def video_for_send(self, video_id: int):
         with self.connect() as conn:
-            return conn.execute(
-                "SELECT stored_filename, telegram_file_id FROM video WHERE id = ?", (video_id,)
-            ).fetchone()
+            return conn.execute("SELECT stored_filename, telegram_file_id FROM video WHERE id = ?", (video_id,)).fetchone()
 
     def set_cover(self, series_id: int, position: int) -> bool:
-        """Set the representative thumbnail to one of the series videos."""
         with self.connect() as conn:
-            row = conn.execute(
-                "SELECT id FROM video WHERE series_id = ? AND position = ?",
-                (series_id, position),
-            ).fetchone()
+            row = conn.execute("SELECT id FROM video WHERE series_id = ? AND position = ?", (series_id, position)).fetchone()
             if not row:
                 return False
-            conn.execute(
-                "UPDATE series SET cover_video_id = ? WHERE id = ?",
-                (row["id"], series_id),
-            )
+            conn.execute("UPDATE series SET cover_video_id = ? WHERE id = ?", (row["id"], series_id))
             return True
+
+    def rename_series(self, series_id: int, title: str) -> bool:
+        with self.connect() as conn:
+            return conn.execute("UPDATE series SET title = ? WHERE id = ?", (title, series_id)).rowcount == 1
+
+    def delete_series(self, series_id: int) -> list[str]:
+        with self.connect() as conn:
+            rows = conn.execute("SELECT thumbnail_path FROM video WHERE series_id = ?", (series_id,)).fetchall()
+            if not conn.execute("SELECT 1 FROM series WHERE id = ?", (series_id,)).fetchone():
+                return []
+            conn.execute("DELETE FROM video WHERE series_id = ?", (series_id,))
+            conn.execute("DELETE FROM series WHERE id = ?", (series_id,))
+            return [row["thumbnail_path"] for row in rows if row["thumbnail_path"]]
