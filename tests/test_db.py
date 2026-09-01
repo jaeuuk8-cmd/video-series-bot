@@ -79,6 +79,22 @@ class DatabaseMigrationTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(len(database.list_videos(series_id)), 1)
 
+    def test_series_archives_can_be_replaced_and_invalidated(self):
+        database = Database(self.path)
+        series_id = database.create_series("ZIP 테스트")
+        database.replace_archives(
+            series_id,
+            [{
+                "part_number": 1,
+                "filename": "ZIP 테스트.zip",
+                "telegram_file_id": "archive-file",
+                "size_bytes": 123,
+            }],
+        )
+        self.assertEqual(database.list_archives(series_id)[0]["filename"], "ZIP 테스트.zip")
+        database.rename_series(series_id, "새 제목")
+        self.assertEqual(database.list_archives(series_id), [])
+
 
 if __name__ == "__main__":
     unittest.main()
