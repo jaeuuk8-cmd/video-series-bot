@@ -24,6 +24,7 @@ class Database:
                   stored_filename TEXT NOT NULL,
                   original_filename TEXT NOT NULL,
                   telegram_file_id TEXT NOT NULL,
+                  file_unique_id TEXT,
                   thumbnail_path TEXT,
                   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                   UNIQUE(series_id, position)
@@ -46,6 +47,7 @@ class Database:
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
                   job_id INTEGER NOT NULL REFERENCES ingest_job(id) ON DELETE CASCADE,
                   source_file_id TEXT NOT NULL,
+                  file_unique_id TEXT,
                   original_filename TEXT NOT NULL,
                   kind TEXT NOT NULL,
                   status TEXT NOT NULL DEFAULT 'pending',
@@ -64,6 +66,16 @@ class Database:
                   update_id INTEGER PRIMARY KEY,
                   processed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE TABLE IF NOT EXISTS series_archive (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  series_id INTEGER NOT NULL REFERENCES series(id) ON DELETE CASCADE,
+                  part_number INTEGER NOT NULL,
+                  filename TEXT NOT NULL,
+                  telegram_file_id TEXT NOT NULL,
+                  size_bytes INTEGER NOT NULL,
+                  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                  UNIQUE(series_id, part_number)
+                );
                 CREATE INDEX IF NOT EXISTS idx_ingest_job_user_status
                   ON ingest_job(user_id, status);
                 CREATE INDEX IF NOT EXISTS idx_ingest_file_job_status
@@ -73,6 +85,11 @@ class Database:
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(video)")}
             if "job_file_id" not in columns:
                 conn.execute("ALTER TABLE video ADD COLUMN job_file_id INTEGER")
+            if "file_unique_id" not in columns:
+                conn.execute("ALTER TABLE video ADD COLUMN file_unique_id TEXT")
+            ingest_columns = {row["name"] for row in conn.execute("PRAGMA table_info(ingest_file)")}
+            if "file_unique_id" not in ingest_columns:
+                conn.execute("ALTER TABLE ingest_file ADD COLUMN file_unique_id TEXT")
             conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_video_job_file ON video(job_file_id) WHERE job_file_id IS NOT NULL"
             )
@@ -95,7 +112,8 @@ class Database:
             return conn.execute("INSERT INTO series(title) VALUES (?)", (title,)).lastrowid
 
     def add_video(self, series_id: int, position: int, stored_filename: str, original_filename: str,
-                  telegram_file_id: str, thumbnail_path: str | None, job_file_id: int | None = None) -> int:
+                  telegram_file_id: str, thumbnail_path: str | None, job_file_id: int | None = None,
+                  file_unique_id: str | None = None) -> int:
         with self.connect() as conn:
             if job_file_id is not None:
                 existing = conn.execute(
@@ -105,9 +123,9 @@ class Database:
                     return int(existing["id"])
             video_id = conn.execute(
                 """INSERT INTO video(series_id, position, stored_filename, original_filename,
-                                      telegram_file_id, thumbnail_path, job_file_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (series_id, position, stored_filename, original_filename, telegram_file_id, thumbnail_path, job_file_id),
+                                      telegram_file_id, thumbnail_path, job_file_id, file_unique_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (series_id, position, stored_filename, original_filename, telegram_file_id, thumbnail_path, job_file_id, file_unique_id),
             ).lastrowid
             conn.execute("UPDATE series SET cover_video_id = COALESCE(cover_video_id, ?) WHERE id = ?", (video_id, series_id))
             return video_id
@@ -171,9 +189,12 @@ class Database:
 
     def rename_series(self, series_id: int, title: str) -> bool:
         with self.connect() as conn:
-            return conn.execute(
+            changed = conn.execute(
                 "UPDATE series SET title = ? WHERE id = ?", (title, series_id)
             ).rowcount == 1
+            if changed:
+                conn.execute("DELETE FROM series_archive WHERE series_id = ?", (series_id,))
+            return changed
 
     def delete_series(self, series_id: int) -> list[str]:
         """Delete one series and return its thumbnail paths for filesystem cleanup."""
@@ -184,8 +205,52 @@ class Database:
             if not conn.execute("SELECT 1 FROM series WHERE id = ?", (series_id,)).fetchone():
                 return []
             conn.execute("DELETE FROM video WHERE series_id = ?", (series_id,))
+            conn.execute("DELETE FROM series_archive WHERE series_id = ?", (series_id,))
             conn.execute("DELETE FROM series WHERE id = ?", (series_id,))
             return [row["thumbnail_path"] for row in rows if row["thumbnail_path"]]
+
+    def series_title(self, series_id: int) -> str | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT title FROM series WHERE id = ?", (series_id,)).fetchone()
+            return str(row["title"]) if row else None
+
+    def files_for_archive(self, series_id: int):
+        with self.connect() as conn:
+            return conn.execute(
+                """SELECT id, position, stored_filename, telegram_file_id
+                   FROM video WHERE series_id = ? ORDER BY position""",
+                (series_id,),
+            ).fetchall()
+
+    def replace_archives(self, series_id: int, archives: list[dict]):
+        with self.connect() as conn:
+            conn.execute("DELETE FROM series_archive WHERE series_id = ?", (series_id,))
+            conn.executemany(
+                """INSERT INTO series_archive(series_id, part_number, filename, telegram_file_id, size_bytes)
+                   VALUES (?, ?, ?, ?, ?)""",
+                [
+                    (
+                        series_id,
+                        item["part_number"],
+                        item["filename"],
+                        item["telegram_file_id"],
+                        item["size_bytes"],
+                    )
+                    for item in archives
+                ],
+            )
+
+    def list_archives(self, series_id: int):
+        with self.connect() as conn:
+            return conn.execute(
+                """SELECT part_number, filename, telegram_file_id, size_bytes
+                   FROM series_archive WHERE series_id = ? ORDER BY part_number""",
+                (series_id,),
+            ).fetchall()
+
+    def invalidate_archives(self, series_id: int):
+        with self.connect() as conn:
+            conn.execute("DELETE FROM series_archive WHERE series_id = ?", (series_id,))
 
     def active_job(self, user_id: int):
         with self.connect() as conn:
@@ -218,12 +283,14 @@ class Database:
                 (user_id, chat_id, mode, target_series_id),
             ).lastrowid
 
-    def add_job_file(self, job_id: int, source_file_id: str, original_filename: str, kind: str) -> bool:
+    def add_job_file(self, job_id: int, source_file_id: str, original_filename: str, kind: str,
+                     file_unique_id: str | None = None) -> bool:
         with self.connect() as conn:
             cursor = conn.execute(
-                """INSERT OR IGNORE INTO ingest_file(job_id, source_file_id, original_filename, kind)
-                   VALUES (?, ?, ?, ?)""",
-                (job_id, source_file_id, original_filename, kind),
+                """INSERT OR IGNORE INTO ingest_file(
+                     job_id, source_file_id, original_filename, kind, file_unique_id
+                   ) VALUES (?, ?, ?, ?, ?)""",
+                (job_id, source_file_id, original_filename, kind, file_unique_id),
             )
             conn.execute(
                 "UPDATE ingest_job SET status = 'collecting', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
