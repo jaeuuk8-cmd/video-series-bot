@@ -6,6 +6,8 @@ import logging
 import os
 import shutil
 import subprocess
+import re
+import zipfile
 from pathlib import Path
 from urllib.parse import parse_qsl
 
@@ -25,12 +27,16 @@ OWNER_ID = int(os.environ["OWNER_TELEGRAM_ID"])
 BOT_API_URL = os.getenv("BOT_API_URL", "http://telegram-bot-api:8081").rstrip("/")
 PUBLIC_HOST = os.environ["PUBLIC_HOST"]
 IDLE_SECONDS = int(os.getenv("SERIES_IDLE_SECONDS", "5"))
+ARCHIVE_PART_BYTES = int(os.getenv("ARCHIVE_PART_MB", "1850")) * 1024 * 1024
 db = Database(DATA_DIR / "library.db")
 app = FastAPI()
 
 
 collect_tasks: dict[int, asyncio.Task] = {}
 running_jobs: dict[int, asyncio.Task] = {}
+archive_tasks: dict[int, asyncio.Task] = {}
+job_lock = asyncio.Lock()
+archive_lock = asyncio.Lock()
 # A target selected with /add (or the library's Add media button).  Only the
 # owner can use this bot, so one target per owner is sufficient.
 adding_to_series: dict[int, int] = {}
@@ -116,7 +122,12 @@ def media_from(message: dict) -> dict | None:
     # 파일(문서) 전송을 우선 권장하지만 동영상 메시지도 허용합니다.
     if message.get("photo"):
         photo = message["photo"][-1]
-        return {"file_id": photo["file_id"], "original_filename": "photo.jpg", "kind": "image"}
+        return {
+            "file_id": photo["file_id"],
+            "file_unique_id": photo.get("file_unique_id"),
+            "original_filename": "photo.jpg",
+            "kind": "image",
+        }
 
     media = message.get("document") or message.get("video")
     if not media:
@@ -128,6 +139,7 @@ def media_from(message: dict) -> dict | None:
         return None
     return {
         "file_id": media["file_id"],
+        "file_unique_id": media.get("file_unique_id"),
         "original_filename": filename,
         "kind": "image" if mime.startswith("image/") or extension in IMAGE_EXTENSIONS else "video",
     }
@@ -154,7 +166,11 @@ async def enqueue_video(message: dict, media: dict):
     mode = "append" if target_series_id is not None else "new"
     job_id = db.get_or_create_collecting_job(user_id, chat_id, mode, target_series_id)
     added = db.add_job_file(
-        job_id, media["file_id"], media["original_filename"], media["kind"]
+        job_id,
+        media["file_id"],
+        media["original_filename"],
+        media["kind"],
+        media.get("file_unique_id"),
     )
     if not added:
         await tg.send_text(chat_id, "같은 파일은 이 묶음에 한 번만 추가됩니다.")
@@ -185,6 +201,112 @@ def sequential_filename(position: int, original_filename: str, kind: str) -> str
     return f"{position}{extension if extension in SUPPORTED_EXTENSIONS else fallback}"
 
 
+def safe_archive_name(title: str) -> str:
+    value = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', "_", title).strip(" ._")
+    return (value or "series")[:80]
+
+
+def write_zip(path: Path, files: list[tuple[Path, str]]):
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
+        for source, stored_name in files:
+            archive.write(source, arcname=stored_name)
+
+
+def schedule_archive(series_id: int, chat_id: int):
+    current = archive_tasks.get(series_id)
+    if current and not current.done():
+        return
+    task = asyncio.create_task(build_archive_serialized(series_id, chat_id))
+    archive_tasks[series_id] = task
+    task.add_done_callback(lambda _task: archive_tasks.pop(series_id, None))
+
+
+async def build_archive_serialized(series_id: int, chat_id: int):
+    async with archive_lock:
+        await build_series_archives(series_id, chat_id)
+
+
+async def build_series_archives(series_id: int, chat_id: int):
+    title = db.series_title(series_id)
+    rows = db.files_for_archive(series_id)
+    if not title or not rows:
+        return
+    work_dir = DATA_DIR / "jobs" / f"archive-series-{series_id}"
+    shutil.rmtree(work_dir, ignore_errors=True)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        resolved: list[tuple[Path, str, int]] = []
+        for row in rows:
+            info = await tg.call("getFile", file_id=row["telegram_file_id"])
+            source = Path(info["file_path"])
+            if not source.exists():
+                raise RuntimeError(f"{row['stored_filename']} 파일을 찾지 못했습니다.")
+            size = source.stat().st_size
+            if size > ARCHIVE_PART_BYTES:
+                raise RuntimeError(
+                    f"{row['stored_filename']} 하나가 ZIP 전송 한도보다 큽니다."
+                )
+            resolved.append((source, row["stored_filename"], size))
+
+        parts: list[list[tuple[Path, str, int]]] = []
+        current: list[tuple[Path, str, int]] = []
+        current_size = 0
+        for item in resolved:
+            if current and current_size + item[2] > ARCHIVE_PART_BYTES:
+                parts.append(current)
+                current = []
+                current_size = 0
+            current.append(item)
+            current_size += item[2]
+        if current:
+            parts.append(current)
+
+        base_name = safe_archive_name(title)
+        uploaded = []
+        for index, part in enumerate(parts, start=1):
+            required = sum(item[2] for item in part) + 512 * 1024 * 1024
+            if shutil.disk_usage(DATA_DIR).free < required:
+                raise RuntimeError("ZIP 생성을 위한 서버 디스크 여유 공간이 부족합니다.")
+            filename = (
+                f"{base_name}.zip"
+                if len(parts) == 1
+                else f"{base_name}.part{index:02d}.zip"
+            )
+            archive_path = work_dir / filename
+            await asyncio.to_thread(
+                write_zip,
+                archive_path,
+                [(item[0], item[1]) for item in part],
+            )
+            sent = await tg.send_document(chat_id, archive_path, filename)
+            attachment = sent.get("document")
+            if not attachment:
+                raise RuntimeError("Telegram에서 ZIP 파일 정보를 받지 못했습니다.")
+            uploaded.append(
+                {
+                    "part_number": index,
+                    "filename": filename,
+                    "telegram_file_id": attachment["file_id"],
+                    "size_bytes": archive_path.stat().st_size,
+                }
+            )
+            try:
+                await tg.call("deleteMessage", chat_id=chat_id, message_id=sent["message_id"])
+            except Exception:
+                LOGGER.warning("Could not delete temporary ZIP upload", exc_info=True)
+            archive_path.unlink(missing_ok=True)
+        db.replace_archives(series_id, uploaded)
+        await tg.send_text(
+            chat_id,
+            f"‘{title}’ ZIP 준비가 끝났습니다. /library에서 필요할 때 받을 수 있습니다."
+        )
+    except Exception as exc:
+        LOGGER.exception("Archive creation failed: series_id=%s", series_id)
+        await tg.send_text(chat_id, f"ZIP 생성에 실패했습니다: {exc}")
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
 async def update_progress(chat_id: int, message_id: int | None, text: str):
     try:
         if message_id:
@@ -201,9 +323,14 @@ def schedule_job(job_id: int):
     current = running_jobs.get(job_id)
     if current and not current.done():
         return
-    task = asyncio.create_task(process_job(job_id))
+    task = asyncio.create_task(process_job_serialized(job_id))
     running_jobs[job_id] = task
     task.add_done_callback(lambda _task: running_jobs.pop(job_id, None))
+
+
+async def process_job_serialized(job_id: int):
+    async with job_lock:
+        await process_job(job_id)
 
 
 async def process_job(job_id: int):
@@ -218,6 +345,7 @@ async def process_job(job_id: int):
             await tg.send_text(chat_id, "추가할 시리즈를 찾지 못했습니다. /library에서 다시 선택하세요.")
             return
         series_id = int(series_id)
+        db.invalidate_archives(series_id)
         start_text = f"시리즈 #{series_id}에 파일을 추가합니다."
     else:
         if not job["title"]:
@@ -299,6 +427,7 @@ async def process_job(job_id: int):
                     uploaded_file_id,
                     str(thumb) if thumb.exists() else None,
                     job_file_id=file_id,
+                    file_unique_id=item["file_unique_id"],
                 )
                 db.mark_file_completed(file_id, video_id)
                 completed += 1
@@ -336,6 +465,7 @@ async def process_job(job_id: int):
             progress_id,
             f"등록이 끝났습니다. {completed}/{total}개 저장됨\n/library 에서 확인하세요.",
         )
+        schedule_archive(series_id, chat_id)
 
 
 def webapp_button():
@@ -492,6 +622,25 @@ async def select_series_for_append(series_id: int, x_telegram_init_data: str | N
     return {"ok": True}
 
 
+@app.post("/api/series/{series_id}/archive/send")
+async def send_series_archive(series_id: int, x_telegram_init_data: str | None = Header(default=None)):
+    validate_init_data(x_telegram_init_data)
+    if not db.series_exists(series_id):
+        raise HTTPException(404, "Series not found.")
+    archives = db.list_archives(series_id)
+    if not archives:
+        schedule_archive(series_id, OWNER_ID)
+        return {"ok": True, "status": "building"}
+    for archive in archives:
+        await tg.call(
+            "sendDocument",
+            chat_id=OWNER_ID,
+            document=archive["telegram_file_id"],
+            caption=archive["filename"],
+        )
+    return {"ok": True, "status": "sent", "parts": len(archives)}
+
+
 @app.post("/api/video/{video_id}/send")
 async def send_video(video_id: int, x_telegram_init_data: str | None = Header(default=None)):
     validate_init_data(x_telegram_init_data)
@@ -546,7 +695,7 @@ async function imageUrl(url){if(!url)return '';var response=await fetch(url,{hea
 function makeCard(name,cover,subtitle,handler){var card=document.createElement('button');card.className='card';if(cover){var image=document.createElement('img');image.className='cover';image.src=cover;card.appendChild(image);}else{var blank=document.createElement('div');blank.className='cover';card.appendChild(blank);}var nameEl=document.createElement('b');nameEl.textContent=name;card.appendChild(nameEl);var sub=document.createElement('div');sub.className='muted';sub.textContent=subtitle;card.appendChild(sub);card.onclick=handler;return card;}
 async function load(){title.textContent='My series';controls.innerHTML='';var rows=await api('/api/series');list.innerHTML='';for(var i=0;i<rows.length;i++){var series=rows[i];var cover=await imageUrl(series.cover);list.appendChild(makeCard(series.title,cover,series.count+' items',(function(value){return function(){openSeries(value);};})(series)));}}
 function showError(error){webApp.showAlert('작업에 실패했습니다: '+String(error.message||error));}
-async function openSeries(series){title.textContent=series.title;controls.innerHTML='';var back=document.createElement('button');back.textContent='Back';back.onclick=load;var add=document.createElement('button');add.textContent='Add media';add.onclick=async function(){try{await api('/api/series/'+series.id+'/add',{method:'POST'});webApp.showAlert('이제 봇 채팅에서 영상 또는 사진을 보내세요. 5초 뒤 자동으로 추가됩니다.');}catch(error){showError(error);}};var rename=document.createElement('button');rename.textContent='Rename';rename.onclick=async function(){var value=prompt('New series title',series.title);if(!value||!value.trim())return;try{await api('/api/series/'+series.id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:value.trim()})});await load();}catch(error){showError(error);}};var remove=document.createElement('button');remove.className='danger';remove.textContent='Delete';remove.onclick=async function(){if(!confirm('Delete this series and its thumbnails?'))return;try{await api('/api/series/'+series.id,{method:'DELETE'});await load();}catch(error){showError(error);}};controls.append(back,add,rename,remove);var rows=await api('/api/series/'+series.id);list.innerHTML='';for(var i=0;i<rows.length;i++){var video=rows[i];var thumb=await imageUrl(video.thumb);list.appendChild(makeCard(video.filename,thumb,'Tap to send to Telegram',(function(value){return async function(){try{await api('/api/video/'+value.id+'/send',{method:'POST'});webApp.showAlert(value.filename+' was sent to this chat.');}catch(error){showError(error);}};})(video)));}}
+async function openSeries(series){title.textContent=series.title;controls.innerHTML='';var back=document.createElement('button');back.textContent='Back';back.onclick=load;var add=document.createElement('button');add.textContent='Add media';add.onclick=async function(){try{await api('/api/series/'+series.id+'/add',{method:'POST'});webApp.showAlert('이제 봇 채팅에서 영상 또는 사진을 보내세요. 5초 뒤 자동으로 추가됩니다.');}catch(error){showError(error);}};var zip=document.createElement('button');zip.textContent='Send ZIP';zip.onclick=async function(){try{var result=await api('/api/series/'+series.id+'/archive/send',{method:'POST'});webApp.showAlert(result.status==='sent'?'ZIP 파일을 채팅으로 보냈습니다.':'ZIP을 만들기 시작했습니다. 완료되면 봇이 알려드립니다.');}catch(error){showError(error);}};var rename=document.createElement('button');rename.textContent='Rename';rename.onclick=async function(){var value=prompt('New series title',series.title);if(!value||!value.trim())return;try{await api('/api/series/'+series.id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:value.trim()})});await load();}catch(error){showError(error);}};var remove=document.createElement('button');remove.className='danger';remove.textContent='Delete';remove.onclick=async function(){if(!confirm('Delete this series and its thumbnails?'))return;try{await api('/api/series/'+series.id,{method:'DELETE'});await load();}catch(error){showError(error);}};controls.append(back,add,zip,rename,remove);var rows=await api('/api/series/'+series.id);list.innerHTML='';for(var i=0;i<rows.length;i++){var video=rows[i];var thumb=await imageUrl(video.thumb);list.appendChild(makeCard(video.filename,thumb,'Tap to send to Telegram',(function(value){return async function(){try{await api('/api/video/'+value.id+'/send',{method:'POST'});webApp.showAlert(value.filename+' was sent to this chat.');}catch(error){showError(error);}};})(video)));}}
 load().catch(function(error){list.textContent='라이브러리를 불러오지 못했습니다.';showError(error);});
 })();
 </script></html>"""
